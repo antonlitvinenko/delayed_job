@@ -8,7 +8,7 @@ require 'logger'
 module Delayed
   class Worker
     include ActiveSupport::Callbacks
-    
+
     cattr_accessor :min_priority, :max_priority, :max_attempts, :max_run_time, :default_priority, :sleep_delay, :logger, :delay_jobs, :queues
     self.sleep_delay = 5
     self.max_attempts = 25
@@ -44,7 +44,7 @@ module Delayed
     end
 
     def self.guess_backend
-      warn "[DEPRECATION] guess_backend is deprecated. Please remove it from your code."      
+      warn "[DEPRECATION] guess_backend is deprecated. Please remove it from your code."
     end
 
     def self.before_fork
@@ -54,11 +54,11 @@ module Delayed
           @files_to_reopen << file unless file.closed?
         end
       end
-      
+
       backend.before_fork
     end
-    
-    def self.after_fork      
+
+    def self.after_fork
       # Re-open file handles
       @files_to_reopen.each do |file|
         begin
@@ -67,10 +67,10 @@ module Delayed
         rescue ::Exception
         end
       end
-      
+
       backend.after_fork
     end
-        
+
     define_callbacks :execute, :loop, :perform, :error, :failure
 
     def initialize(options={})
@@ -98,10 +98,15 @@ module Delayed
 
     set_callback(:execute, :around, :clear_locks)
     set_callback(:execute, :before) { |worker| worker.say "Starting job worker" }
-    
+
     def start
       trap('TERM') { say 'Exiting...'; stop }
       trap('INT')  { say 'Exiting...'; stop }
+
+      trap('TERM') { say 'Exiting...'; $exit = true }
+      trap('INT')  { say 'Exiting...'; $exit = true }
+
+      recover_crashed_jobs!
 
       run_callbacks(:execute) do
         loop do
@@ -122,7 +127,7 @@ module Delayed
               say "#{count} jobs processed at %.4f j/s, %d failed ..." % [count / realtime, result.last]
             end
           end
-        
+
           break if @exit
         end
       end
@@ -131,7 +136,7 @@ module Delayed
     def stop
       @exit = true
     end
-    
+
     # Do num jobs and return stats on success/failure.
     # Exit early if interrupted.
     def work_off(num = 100)
@@ -200,6 +205,40 @@ module Delayed
 
   protected
 
+    # Finds locked jobs in database, then checks if the process IDs exist, if not, triggers recovery action.
+    def recover_crashed_jobs!
+      Delayed::Job.find_each do |job|
+        if job.locked_by
+          pid = job.locked_by.match(/(?:pid\:)(\d+)/).to_a.last.to_i
+          host_name = job.locked_by.match(/(?:host\:)(.+)(?: pid\:\d+)/).to_a.last
+
+          if !is_process_running?(pid) && Socket.gethostname == host_name
+            say job.last_error = "* [JOB] Worker process crashed #{job.locked_by}, recovering job..."
+            job.save
+
+            if job.payload_object.respond_to? :recover
+              say "* [JOB] Running recover hook"
+              job.payload_object.recover
+            end
+
+            reschedule(job)
+
+          end
+        end
+      end
+    rescue => e
+      say "* [ERROR] #{e.message}\n" + e.backtrace.join("\n")
+    end
+
+    def is_process_running?(pid)
+      begin
+        Process.getpgid(pid)
+        true
+      rescue Errno::ESRCH
+        false
+      end
+    end
+
     def handle_failed_job(job, error)
       job.last_error = "{#{error.message}\n#{error.backtrace.join('\n')}"
       say "#{job.name} failed with #{error.class.name}: #{error.message} - #{job.attempts} failed attempts", Logger::ERROR
@@ -214,7 +253,7 @@ module Delayed
       run_callbacks(:perform){ result = run(job) } if job
       result
     end
-    
+
     def clear_locks
       yield
     ensure
